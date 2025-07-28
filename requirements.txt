@@ -1,0 +1,13 @@
+# MCP SDK
+mcp==1.0.0
+
+# ML dependencies
+transformers==4.35.2
+torch>=2.0.0
+numpy>=1.24.0
+accelerate==0.24.1
+
+# Server dependencies  
+uvicorn[standard]==0.24.0
+fastapi==0.104.1
+pydantic==2.5.0
