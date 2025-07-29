@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BioClinicalBERT MCP Server
-Exposes BioClinicalBERT NER capabilities via Model Context Protocol
+BioClinicalBERT MCP Server - Basic Version
+Compatible with standard MCP Python SDK
 """
 
 import asyncio
@@ -10,18 +10,26 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-# MCP Server imports
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.server.models import InitializationOptions
-from mcp.types import (
-    Tool,
-    TextContent,
-    CallToolRequest,
-    CallToolResult,
-    ListToolsRequest,
-    ListToolsResult,
-)
+# Basic MCP imports - try different import paths
+try:
+    from mcp.server import NotificationOptions, Server
+    from mcp.server.models import InitializationOptions
+    import mcp.server.stdio
+    import mcp.types as types
+except ImportError:
+    try:
+        from mcp.server.lowlevel import NotificationOptions, Server
+        from mcp.server.models import InitializationOptions
+        import mcp.server.stdio
+        import mcp.types as types
+    except ImportError:
+        # Final fallback - try the most basic import structure
+        from mcp import server
+        from mcp import types
+        from mcp.server.models import InitializationOptions
+        import mcp.server.stdio
+        Server = server.Server
+        NotificationOptions = getattr(server, 'NotificationOptions', None)
 
 # ML imports
 import torch
@@ -33,7 +41,8 @@ logger = logging.getLogger(__name__)
 
 class BioClinicalBERTService:
     def __init__(self):
-        self.model_name = "emilyalsentzer/Bio_ClinicalBERT"
+        # Using Clinical-AI-Apollo/Medical-NER - best available medical NER model
+        self.model_name = "Clinical-AI-Apollo/Medical-NER"
         self.tokenizer = None
         self.model = None
         self.ner_pipeline = None
@@ -41,17 +50,15 @@ class BioClinicalBERTService:
         
         # Medical entity mapping (dynamically loaded from model)
         self.entity_mapping = {}
+        # Updated mapping for Clinical-AI-Apollo/Medical-NER model
         self.medical_categories = {
-            'B-PROBLEM': 'CONDITION',
-            'I-PROBLEM': 'CONDITION', 
-            'B-TREATMENT': 'PROCEDURE',
-            'I-TREATMENT': 'PROCEDURE',
-            'B-TEST': 'PROCEDURE',
-            'I-TEST': 'PROCEDURE',
-            'B-MEDICATION': 'MEDICATION',
-            'I-MEDICATION': 'MEDICATION',
-            'B-DOSAGE': 'MEASUREMENT',
-            'I-DOSAGE': 'MEASUREMENT'
+            'B-PROBLEM': 'PROBLEM',
+            'I-PROBLEM': 'PROBLEM',
+            'B-TREATMENT': 'TREATMENT', 
+            'I-TREATMENT': 'TREATMENT',
+            'B-TEST': 'TEST',
+            'I-TEST': 'TEST',
+            'O': 'OTHER'
         }
         
     async def load_model(self):
@@ -60,40 +67,55 @@ class BioClinicalBERTService:
             return
             
         try:
-            logger.info(f"Loading BioClinicalBERT model: {self.model_name}...")
+            logger.info(f"Loading Medical NER model: {self.model_name}...")
             start_time = time.time()
             
-            # Load tokenizer and model
+            # Load tokenizer and model for medical NER
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.model = AutoModelForTokenClassification.from_pretrained(self.model_name)
             
-            # Create NER pipeline
+            # Create NER pipeline with optimized settings for medical text
             self.ner_pipeline = pipeline(
                 "ner",
                 model=self.model,
                 tokenizer=self.tokenizer,
-                aggregation_strategy="simple",
-                device=0 if torch.cuda.is_available() else -1
+                aggregation_strategy="simple",  # Groups B- and I- tags
+                device=0 if torch.cuda.is_available() else -1,
+                ignore_labels=["O"]  # Skip 'Outside' tokens
             )
             
-            # Dynamically get label mapping from model config
+            # Get label mapping from model config
             if hasattr(self.model.config, 'id2label'):
                 self.entity_mapping = self.model.config.id2label
                 logger.info(f"Model label mapping: {self.entity_mapping}")
+                
+                # Update medical_categories based on actual model labels
+                if self.entity_mapping:
+                    # Clear default mapping and use model's actual labels
+                    self.medical_categories = {}
+                    for label_id, label_name in self.entity_mapping.items():
+                        if label_name.startswith('B-') or label_name.startswith('I-'):
+                            base_label = label_name[2:]  # Remove B- or I- prefix
+                            self.medical_categories[label_name] = base_label.upper()
+                        else:
+                            self.medical_categories[label_name] = label_name.upper()
+                    
+                    logger.info(f"Updated medical categories: {set(self.medical_categories.values())}")
             else:
                 logger.warning("Model config doesn't have id2label, using default mapping")
             
             load_time = time.time() - start_time
-            logger.info(f"BioClinicalBERT loaded successfully in {load_time:.2f}s")
+            logger.info(f"Medical NER model loaded successfully in {load_time:.2f}s")
             logger.info(f"Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
+            logger.info(f"Supported entities: {list(set(self.medical_categories.values()))}")
             self.is_loaded = True
             
         except Exception as e:
-            logger.error(f"Failed to load BioClinicalBERT: {str(e)}")
+            logger.error(f"Failed to load Medical NER model: {str(e)}")
             raise e
     
     def extract_medical_entities(self, text: str, confidence_threshold: float = 0.5) -> List[Dict]:
-        """Extract medical entities using BioClinicalBERT"""
+        """Extract medical entities using Clinical-AI-Apollo Medical NER model"""
         if not self.is_loaded:
             raise ValueError("Model not loaded")
         
@@ -104,16 +126,18 @@ class BioClinicalBERTService:
             # Process entities
             processed_entities = []
             for entity in raw_entities:
-                if entity.get('score', 0) >= confidence_threshold:
-                    # Map entity label to medical category
-                    entity_label = entity.get('entity', entity.get('entity_group', 'O'))
+                confidence = entity.get('score', 0)
+                if confidence >= confidence_threshold:
+                    # Get entity label and map to medical category
+                    entity_label = entity.get('entity_group', entity.get('entity', 'O'))
                     mapped_label = self.medical_categories.get(entity_label, entity_label)
                     
-                    if mapped_label != 'O':  # Skip outside tokens
+                    # Skip 'O' (Outside) tokens and low-confidence predictions
+                    if mapped_label not in ['O', 'OTHER', 'OUTSIDE']:
                         processed_entity = {
                             'text': entity['word'].replace('##', '').strip(),
                             'label': mapped_label,
-                            'confidence': float(entity['score']),
+                            'confidence': float(confidence),
                             'start': int(entity.get('start', 0)),
                             'end': int(entity.get('end', 0)),
                             'context': self._get_context(text, entity.get('start', 0), entity.get('end', 0))
@@ -166,14 +190,18 @@ class BioClinicalBERTService:
 # Initialize the BioClinicalBERT service
 bio_service = BioClinicalBERTService()
 
-# Create MCP Server
-server = Server("bioclinical-bert-server")
+# Create MCP Server with flexible initialization
+try:
+    server = Server("bioclinical-bert-server")
+except TypeError:
+    # Some versions might not need the name parameter
+    server = Server()
 
 @server.list_tools()
-async def handle_list_tools() -> list[Tool]:
+async def handle_list_tools() -> list[types.Tool]:
     """List available tools"""
     return [
-        Tool(
+        types.Tool(
             name="extractMedicalEntities",
             description="Extract medical entities using BioClinicalBERT",
             inputSchema={
@@ -197,7 +225,7 @@ async def handle_list_tools() -> list[Tool]:
                 "required": ["text"]
             }
         ),
-        Tool(
+        types.Tool(
             name="getModelInfo",
             description="Get BioClinicalBERT model information",
             inputSchema={
@@ -208,7 +236,7 @@ async def handle_list_tools() -> list[Tool]:
     ]
 
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     """Handle tool calls"""
     
     if name == "extractMedicalEntities":
@@ -239,19 +267,19 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "entitiesFound": len(entities),
                 "confidence": avg_confidence,
                 "processingTimeMs": processing_time,
-                "model": "BioClinicalBERT",
+                "model": "Clinical-AI-Apollo/Medical-NER",
                 "entities": entities
             }
             
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
             
         except Exception as e:
             error_result = {
                 "success": False,
                 "error": str(e),
-                "model": "BioClinicalBERT"
+                "model": "Clinical-AI-Apollo/Medical-NER"
             }
-            return [TextContent(type="text", text=json.dumps(error_result, indent=2))]
+            return [types.TextContent(type="text", text=json.dumps(error_result, indent=2))]
     
     elif name == "getModelInfo":
         try:
@@ -264,44 +292,56 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "entityMapping": bio_service.entity_mapping
             }
             
-            return [TextContent(type="text", text=json.dumps(model_info, indent=2))]
+            return [types.TextContent(type="text", text=json.dumps(model_info, indent=2))]
             
         except Exception as e:
             error_result = {
                 "success": False,
                 "error": str(e)
             }
-            return [TextContent(type="text", text=json.dumps(error_result, indent=2))]
+            return [types.TextContent(type="text", text=json.dumps(error_result, indent=2))]
     
     else:
         raise ValueError(f"Unknown tool: {name}")
 
 async def main():
     """Main entry point"""
-    logger.info("Starting BioClinicalBERT MCP Server...")
+    logger.info("Starting Medical NER MCP Server...")
     
     # Load model on startup
     try:
         await bio_service.load_model()
-        logger.info("✅ BioClinicalBERT MCP Server ready!")
+        logger.info("✅ Medical NER MCP Server ready!")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize BioClinicalBERT: {e}")
+        logger.error(f"❌ Failed to initialize Medical NER model: {e}")
         raise
     
-    # Run the server
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="bioclinical-bert-server",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=None,
-                    experimental_capabilities=None,
+    # Run the server with flexible capabilities handling
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        try:
+            # Try with NotificationOptions if available
+            if NotificationOptions:
+                capabilities = server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                )
+            else:
+                # Fallback to basic capabilities
+                capabilities = server.get_capabilities()
+                
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="medical-ner-server",
+                    server_version="1.0.0",
+                    capabilities=capabilities,
                 ),
-            ),
-        )
+            )
+        except TypeError as e:
+            # Handle different MCP SDK versions
+            logger.warning(f"Capabilities initialization failed, trying alternative: {e}")
+            await server.run(read_stream, write_stream)
 
 if __name__ == "__main__":
     asyncio.run(main())
